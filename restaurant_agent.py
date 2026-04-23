@@ -32,6 +32,7 @@ Install:
 
 import argparse
 import json
+import re
 import textwrap
 from datetime import datetime
 from pathlib import Path
@@ -50,9 +51,24 @@ except ImportError:
 
 MAX_SEARCHES = 10
 MAX_REFLECTION_SEARCHES = 15  # total budget across the 3 alternative strategies
+CONSOLIDATION_INTERVAL = 10   # consolidate learnings every N learn-mode runs
 LEARNINGS_FILE = Path(__file__).parent / "learnings.md"
 
+# Matches the score annotation appended to every rule: "  [u:3 h:2]"
+_SCORE_RE = re.compile(r'\s*\[u:(\d+) h:(\d+)\]$')
+
 client = anthropic.Anthropic()
+
+
+def _strip_score(text: str) -> str:
+    """Remove the [u:N h:M] annotation from a rule bullet, returning clean rule text."""
+    return _SCORE_RE.sub('', text).strip()
+
+
+def _parse_score(text: str) -> tuple[int, int]:
+    """Return (used_count, helped_count) from a rule bullet, or (0, 0) if not annotated."""
+    m = _SCORE_RE.search(text)
+    return (int(m.group(1)), int(m.group(2))) if m else (0, 0)
 
 
 def _search(query: str, strategy: str = "default") -> str:
@@ -467,7 +483,8 @@ def _save_learnings(user_request: str, reflection: str) -> bool:
         if stripped.lower() == "none":
             return False
         if stripped.startswith("-"):
-            bullets.append(stripped)
+            # Initialise score annotation so every rule is trackable from birth
+            bullets.append(f"{stripped}  [u:0 h:0]")
 
     if not bullets:
         return False
@@ -535,12 +552,13 @@ def load_relevant_learnings(user_request: str) -> str:
     if not LEARNINGS_FILE.exists():
         return ""
 
-    all_bullets = [
-        line.strip()
+    # Strip score annotations — the agent only needs the clean rule text
+    all_bullets_clean = [
+        _strip_score(line.strip())
         for line in LEARNINGS_FILE.read_text().splitlines()
         if line.strip().startswith("-")
     ]
-    if not all_bullets:
+    if not all_bullets_clean:
         return ""
 
     response = client.messages.create(
@@ -556,7 +574,7 @@ def load_relevant_learnings(user_request: str) -> str:
                 as a bullet list. If none apply, reply with exactly: none
 
                 Rules:
-                {chr(10).join(all_bullets)}
+                {chr(10).join(all_bullets_clean)}
             """).strip(),
         }],
     )
@@ -565,6 +583,127 @@ def load_relevant_learnings(user_request: str) -> str:
     ).strip()
 
     return "" if (not result or result.lower() == "none") else result
+
+
+# ---------------------------------------------------------------------------
+# Component 4 — Rule scoring and consolidation
+# ---------------------------------------------------------------------------
+#
+# After each learning-mode run, score_injected_rules updates the [u:N h:M]
+# counters on every rule that was injected: u (used) always increments;
+# h (helped) increments only when learning mode used fewer searches than the
+# paired baseline run (positive search_delta).
+#
+# consolidate_learnings periodically asks Claude to merge near-duplicate rules,
+# remove consistently unhelpful ones (h/u < 0.3 with u >= 3), and produce a
+# tighter ruleset. Called every CONSOLIDATION_INTERVAL learn-mode runs.
+# ---------------------------------------------------------------------------
+
+def score_injected_rules(injected_rules: str, search_delta: int) -> None:
+    """
+    Update used/helped counts on the rules that were injected in a learning run.
+
+    injected_rules  — the string returned by load_relevant_learnings (clean, no annotations)
+    search_delta    — baseline_search_count minus learn_search_count; positive means
+                      learning mode used fewer searches (helped)
+    """
+    if not LEARNINGS_FILE.exists() or not injected_rules.strip():
+        return
+
+    injected_clean = {
+        _strip_score(line.strip())
+        for line in injected_rules.splitlines()
+        if line.strip().startswith("-")
+    }
+    if not injected_clean:
+        return
+
+    helped = search_delta > 0
+    lines = LEARNINGS_FILE.read_text().splitlines()
+    updated = 0
+    new_lines = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("-") and _strip_score(stripped) in injected_clean:
+            u, h = _parse_score(stripped)
+            u += 1
+            h += 1 if helped else 0
+            line = f"{_strip_score(stripped)}  [u:{u} h:{h}]"
+            updated += 1
+        new_lines.append(line)
+
+    LEARNINGS_FILE.write_text("\n".join(new_lines))
+    if updated:
+        verdict = "helped" if helped else "no improvement"
+        print(f"  [Scored {updated} rule(s): {verdict}, delta={search_delta:+d}]")
+
+
+_CONSOLIDATION_PROMPT = """You are maintaining a search-strategy knowledge base for a restaurant recommendation agent.
+
+You will receive a list of "if/then" rules, each annotated with [u:used h:helped].
+
+Your job — produce a tighter, higher-quality ruleset:
+
+1. MERGE near-duplicate rules into one. Keep the more specific/actionable phrasing.
+   Set the merged rule's score to the sum of both rules' counts.
+
+2. REMOVE rules where u >= 3 AND (h / u) < 0.30 — used at least 3 times but helped
+   fewer than 30% of the time. These rules are actively misleading.
+
+3. KEEP all rules where u < 3 — not enough data to judge yet.
+
+4. If two rules contradict each other, keep the one with the higher h/u ratio.
+
+Return ONLY the consolidated bullet list in this exact format (no headers, no explanation):
+- rule text  [u:N h:M]
+- rule text  [u:N h:M]
+"""
+
+
+def consolidate_learnings() -> None:
+    """
+    Merge near-duplicate rules and prune consistently unhelpful ones.
+    Rewrites learnings.md with the consolidated ruleset.
+    """
+    if not LEARNINGS_FILE.exists():
+        return
+
+    all_bullets = [
+        line.strip()
+        for line in LEARNINGS_FILE.read_text().splitlines()
+        if line.strip().startswith("-")
+    ]
+    if len(all_bullets) < 3:
+        return
+
+    print(f"\n[Consolidating {len(all_bullets)} rules...]")
+
+    response = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=1024,
+        system=_CONSOLIDATION_PROMPT,
+        messages=[{"role": "user", "content": "\n".join(all_bullets)}],
+    )
+    result = next(
+        (block.text for block in response.content if hasattr(block, "text")), ""
+    )
+
+    new_bullets = [
+        line.strip()
+        for line in result.splitlines()
+        if line.strip().startswith("-")
+    ]
+    if not new_bullets:
+        return
+
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+    content = (
+        "# Restaurant Agent — Strategy Learnings\n\n"
+        f"## Consolidated: {timestamp} ({len(all_bullets)} → {len(new_bullets)} rules)\n"
+        + "\n".join(new_bullets) + "\n"
+    )
+    LEARNINGS_FILE.write_text(content)
+    print(f"[Consolidation complete: {len(all_bullets)} → {len(new_bullets)} rules]")
 
 
 # ---------------------------------------------------------------------------
