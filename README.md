@@ -2,9 +2,11 @@
 
 ## Purpose
 
-Tool-calling agents repeat the same mistakes. Each request starts from scratch with no memory of what worked before. For repeated similar tasks — finding cheap restaurants in a city, vetting candidates near a landmark — the agent rediscovers the same efficient strategies every time, wasting tool calls it has already paid for.
+This is a toy project to validate one idea: **you can build a self-improving agent without any post-training pipeline** — no fine-tuning, no RLHF, no dataset curation. Just prompt engineering and a plain text file.
 
-This project tests a concrete fix: **learn search policies from past runs and inject them into future similar requests to reduce tool call count.**
+The problem it targets: tool-calling agents repeat the same mistakes. Each request starts from scratch with no memory of what worked before. For repeated similar tasks — finding cheap restaurants in a city, vetting candidates near a landmark — the agent rediscovers the same efficient strategies every time, wasting tool calls it has already paid for.
+
+The fix: **learn search policies from past runs and inject them into future similar requests to reduce tool call count.**
 
 The mechanism is:
 1. After each run, extract the search strategy as reusable `if [condition] → then [action]` rules ("if the request has a hard price cap in euros, include a French-language query early")
@@ -134,32 +136,47 @@ Group D — Bay Area Highway Proximity   (5 requests, location-constrained)
 
 ---
 
+## Project structure
+
+```
+self_improve/
+  README.md
+  src/
+    restaurant_agent.py   # agent, reflection, learning mode, scoring
+    eval_learning.py      # interleaved evaluation harness
+  data/                   # gitignored — written at runtime
+    learnings.md          # accumulated if/then rules with [u:N h:M] scores
+    learnings_pre_eval.md # backup taken before each eval run
+  results/                # gitignored — written at runtime
+    eval_results*.json
+```
+
 ## Usage
 
 ```bash
 pip install anthropic ddgs
 
 # Basic run
-python restaurant_agent.py
+python src/restaurant_agent.py
 
 # Apply past learnings
-python restaurant_agent.py --learn
+python src/restaurant_agent.py --learn
 
 # Deep reflection (runs 3 alternative strategies live)
-python restaurant_agent.py --reflect advanced
+python src/restaurant_agent.py --reflect advanced
 
 # Both
-python restaurant_agent.py --learn --reflect advanced
+python src/restaurant_agent.py --learn --reflect advanced
 
 # Run the full evaluation (all 25 requests)
-python eval_learning.py
+python src/eval_learning.py
 
 # Run only specific groups
-python eval_learning.py --groups A D
+python src/eval_learning.py --groups A D
 
 # Dry-run: preview dataset without API calls
-python eval_learning.py --dry-run
-python eval_learning.py --groups A --dry-run
+python src/eval_learning.py --dry-run
+python src/eval_learning.py --groups A --dry-run
 ```
 
 Requires `ANTHROPIC_API_KEY` to be set in the environment.
