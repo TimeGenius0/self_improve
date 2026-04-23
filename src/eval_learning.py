@@ -7,12 +7,13 @@ and scoring happen immediately so the next request benefits from what was
 just learned. Consolidation runs every CONSOLIDATION_INTERVAL learn-mode runs
 to prune and merge the ruleset.
 
-Execution order for each of the 25 requests:
-  1. Baseline run   — no learning injection, no reflection
-  2. Learn run      — injects rules accumulated from all prior requests
-  3. Reflect        — reflects on the learn run, appends new rules to learnings.md
-  4. Score          — updates rule scores using the baseline vs. learn search delta
-  5. Consolidate    — every CONSOLIDATION_INTERVAL learn runs, prunes the ruleset
+Execution order for each request:
+  1. Baseline run   — no rule injection
+  2. Reflect        — reflects on baseline; rules saved so the learn run benefits
+  3. Learn run      — injects rules (includes rules just learned from baseline)
+  4. Score          — updates rule scores BEFORE synthesis reads the file
+  5. Reflect        — holistic synthesis on learn run; rewrites learnings.md
+  6. Consolidate    — every CONSOLIDATION_INTERVAL learn runs, prunes the ruleset
 
 This interleaved design means later requests benefit from a progressively richer
 and higher-quality ruleset than earlier ones.
@@ -68,49 +69,62 @@ def _make_group(group: str, name: str, requests: list[str]) -> list[RunSpec]:
 
 
 DATASET: list[RunSpec] = [
-    # Group A — Budget/price-sensitive dining in Paris
-    *_make_group("A", "Budget Paris", [
-        "cheap ramen in Paris under 15 euros",
-        "affordable pho in Paris under 12 euros",
-        "budget sushi in Paris under 20 euros",
-        "cheap Vietnamese food in Paris under 15 euros",
-        "inexpensive Japanese noodles in Paris under 18 euros",
+    # Group A — Cheap authentic ethnic food in Paris, specific neighborhood + constraint
+    # Same city throughout. Budget + authenticity + time/format constraint forces multi-step
+    # search: find the ethnic enclave, verify prices, verify the extra constraint.
+    *_make_group("A", "Paris Budget Ethnic", [
+        "cheap authentic ramen near rue Sainte-Anne Paris under 15 euros, sit-down only",
+        "affordable authentic pho in Paris 13th arrondissement under 12 euros open weekday lunch",
+        "budget authentic sushi near Opera Paris under 20 euros, not an all-you-can-eat buffet",
+        "cheap authentic Vietnamese food in Paris Belleville under 12 euros open Sunday evening",
+        "inexpensive authentic udon near Chatelet Paris under 15 euros open for lunch",
     ]),
 
-    # Group B — Romantic/occasion dining
-    *_make_group("B", "Romantic Dining", [
-        "romantic dinner for two in Amsterdam",
-        "intimate anniversary dinner in Barcelona",
-        "date night restaurant in Paris with candlelit atmosphere",
-        "special occasion dinner in Vienna",
-        "romantic restaurant in Copenhagen for a proposal",
+    # Group B — Occasion dining near a Paris landmark, avoiding tourist traps
+    # Same city throughout. Occasion + landmark proximity + anti-tourist-trap is hard to
+    # query directly: requires knowing which neighborhoods surround each landmark and
+    # filtering out tourist menus, which no aggregator exposes as a filter.
+    *_make_group("B", "Paris Occasion Anti-Tourist", [
+        "romantic dinner near Eiffel Tower Paris for a proposal, not a tourist restaurant",
+        "anniversary dinner walking distance from the Louvre Paris that locals actually go to",
+        "date night near Sacre-Coeur Montmartre Paris avoiding tourist trap restaurants",
+        "birthday dinner near Place des Vosges Paris, authentic and not overpriced for tourists",
+        "special occasion dinner near Centre Pompidou Paris with good wine, no tourist menu",
     ]),
 
-    # Group C — Niche dietary restrictions
-    *_make_group("C", "Niche Dietary", [
-        "vegan friendly dinner in London for a date night",
-        "halal fine dining in Paris",
-        "gluten-free restaurant in Berlin",
-        "vegan fine dining in Amsterdam",
-        "halal sushi in London",
+    # Group C — Dietary restriction + occasion + budget in London
+    # Same city throughout. Dietary safety + occasion quality + price cap each require a
+    # separate verification step; finding all three in one restaurant is the search challenge.
+    *_make_group("C", "London Dietary Occasion", [
+        "vegan fine dining in London for a romantic anniversary under 60 pounds for two",
+        "halal restaurant in London for a business dinner under 40 pounds per person",
+        "gluten-free dinner in London for a birthday celebration under 50 pounds per person",
+        "vegan date night in London under 35 pounds per person with good ambiance",
+        "halal fine dining in London for a special occasion under 70 pounds for two",
     ]),
 
-    # Group D — Location-constrained search
-    *_make_group("D", "Location Constrained", [
+    # Group D — Highway proximity + practical constraint in the Bay Area
+    # Same metro area throughout. "Near highway X" cannot be queried directly — requires
+    # mapping the route to neighborhoods first, then searching, then verifying the
+    # secondary constraint (parking, cuisine type, service speed).
+    *_make_group("D", "Bay Area Highway Proximity", [
         "restaurant in SF very close to 101 and with easy parking",
-        "restaurant near Eiffel Tower Paris with easy parking",
-        "restaurant walking distance from Sagrada Familia in Barcelona",
-        "restaurant near Tokyo Station with late night hours",
-        "restaurant near Grand Central Station New York open late",
+        "restaurant in San Jose close to 280 with Indian cuisine and easy parking",
+        "dinner near highway 101 in Palo Alto with quick service and free parking",
+        "lunch near I-280 in San Francisco with outdoor seating and street parking",
+        "restaurant near highway 85 in Sunnyvale with halal or Indian food and easy parking",
     ]),
 
-    # Group E — Cheap authentic ethnic cuisine in a city cluster
-    *_make_group("E", "Cheap Ethnic Cuisine", [
-        "cheap authentic Thai food in London under 15 pounds",
-        "budget Korean BBQ in London under 20 pounds",
-        "cheap authentic Mexican food in Los Angeles under 15 dollars",
-        "inexpensive authentic Chinese food in NYC under 15 dollars",
-        "cheap authentic Ethiopian food in Washington DC under 15 dollars",
+    # Group E — Post-event late-night dining near a specific venue in NYC
+    # Same city throughout. Near [venue] + open late + [occasion need] resists direct
+    # search: requires knowing the venue's neighborhood, finding restaurants that stay
+    # open past show/game end time, and matching the post-event vibe.
+    *_make_group("E", "NYC Post-Event Late Night", [
+        "restaurant near Madison Square Garden NYC open after 10pm for post-concert dinner",
+        "late night dinner near Barclays Center Brooklyn after a basketball game, quick service",
+        "restaurant near Carnegie Hall NYC open past 10:30pm for post-concert supper",
+        "dinner near Lincoln Center NYC open late after the opera, not too loud",
+        "quick dinner near Radio City Music Hall NYC before a show, open from 5pm",
     ]),
 ]
 
@@ -163,11 +177,11 @@ def _parse_strategy_labels(stdout: str) -> list[str]:
     return list(seen)
 
 
-def _capture_run(request: str, injected_learnings: str = "") -> tuple[str, list[str], str]:
+def _capture_run(request: str, injected_learnings: str = "") -> tuple[str, list[str], list[dict], str]:
     tee = _Tee()
     with contextlib.redirect_stdout(tee):
-        answer, queries = run_agent(request, injected_learnings=injected_learnings)
-    return answer, queries, tee.getvalue()
+        answer, queries, search_log = run_agent(request, injected_learnings=injected_learnings)
+    return answer, queries, search_log, tee.getvalue()
 
 
 # ---------------------------------------------------------------------------
@@ -183,11 +197,11 @@ def _execute_run(spec: RunSpec, mode: str, seq_index: int) -> RunRecord:
 
     for attempt in range(2):
         try:
-            answer, queries, captured = _capture_run(spec.request, injected_rules)
+            answer, queries, search_log, captured = _capture_run(spec.request, injected_rules)
             if not answer:
                 raise RuntimeError("run_agent returned empty answer")
 
-            return RunRecord(
+            record = RunRecord(
                 run_id=run_id,
                 group=spec.group,
                 group_name=spec.group_name,
@@ -203,6 +217,8 @@ def _execute_run(spec: RunSpec, mode: str, seq_index: int) -> RunRecord:
                 timestamp=datetime.now(timezone.utc).isoformat(),
                 error=None,
             )
+            record._search_log = search_log  # attached for reflect step, not serialised
+            return record
         except Exception as exc:
             if attempt == 0:
                 print(f"\n  [Retry in 15s after error: {exc}]")
@@ -233,63 +249,83 @@ def _execute_run(spec: RunSpec, mode: str, seq_index: int) -> RunRecord:
 # Interleaved evaluation loop
 # ---------------------------------------------------------------------------
 
-def run_interleaved_evaluation(dataset: list[RunSpec], output_path: str) -> list[RunRecord]:
+def run_interleaved_evaluation(
+    dataset: list[RunSpec], output_path: str, reflect_mode: str = "advanced"
+) -> list[RunRecord]:
     """
     For each request in order:
-      1. Baseline run  — no injection, no reflection
-      2. Learn run     — inject rules accumulated from all prior requests
-      3. Reflect       — reflect on learn run, append new rules
-      4. Score         — update rule scores using the search delta
-      5. Consolidate   — every CONSOLIDATION_INTERVAL learn runs
+      1. Baseline run   — no rule injection
+      2. Reflect        — reflect on baseline; rules saved so the learn run benefits
+      3. Learn run      — inject rules (includes rules just learned from baseline)
+      4. Score          — update rule scores using the baseline vs. learn search delta
+      5. Reflect        — reflect on learn run; synthesise updated ruleset
+      6. Consolidate    — every CONSOLIDATION_INTERVAL learn runs
 
+    Both runs trigger reflection so every request contributes two learning signals.
+    The learn run always sees the freshest possible ruleset including what the
+    baseline just taught.
     Results are saved to disk after every request pair so progress is preserved.
     """
     all_records: list[RunRecord] = []
     learn_run_count = 0
 
     print("\n" + "═" * 70)
-    print("INTERLEAVED EVALUATION — 25 requests × (baseline + learn)")
-    print("Each learn run reflects and scores immediately; later requests")
-    print("benefit from rules accumulated and consolidated over prior runs.")
+    print("INTERLEAVED EVALUATION — requests × (baseline + reflect + learn + reflect)")
+    print("Baseline reflects first; learn run benefits from those fresh rules.")
     print("═" * 70)
 
     for seq_index, spec in enumerate(dataset):
+        n_total = len(dataset)
         print(f"\n{'─'*70}")
-        print(f"[{seq_index+1:02d}/25] {spec.group}{spec.index} | {spec.request}")
+        print(f"[{seq_index+1:02d}/{n_total}] {spec.group}{spec.index} | {spec.request}")
         print(f"{'─'*70}")
 
-        # 1. Baseline
+        # 1. Baseline run — no injection
         print("\n  → Baseline run")
         baseline = _execute_run(spec, mode="baseline", seq_index=seq_index)
         all_records.append(baseline)
 
-        # 2. Learn run
-        print("\n  → Learn run")
+        # 2. Reflect on baseline → update learnings.md before the learn run loads rules
         if not baseline.error:
-            # Indicate how many rules are in play
-            rule_count = sum(
-                1 for line in LEARNINGS_FILE.read_text().splitlines()
-                if line.strip().startswith("-")
-            ) if LEARNINGS_FILE.exists() else 0
-            print(f"  [Learning pool: {rule_count} rules in learnings.md]")
+            print("\n  → Reflecting on baseline run")
+            tee = _Tee()
+            with contextlib.redirect_stdout(tee):
+                reflect_and_learn(
+                    baseline.request, baseline.queries, baseline.answer,
+                    mode=reflect_mode,
+                    search_log=getattr(baseline, "_search_log", None),
+                )
+
+        # 3. Learn run — load_relevant_learnings now includes rules from step 2
+        print("\n  → Learn run")
+        rule_count = sum(
+            1 for line in LEARNINGS_FILE.read_text().splitlines()
+            if line.strip().startswith("-")
+        ) if LEARNINGS_FILE.exists() else 0
+        print(f"  [Learning pool: {rule_count} rules in learnings.md]")
 
         learn = _execute_run(spec, mode="learn", seq_index=seq_index)
         all_records.append(learn)
 
-        # 3. Reflect on learn run → save new rules
         if not learn.error:
-            print("\n  → Reflecting on learn run")
-            tee = _Tee()
-            with contextlib.redirect_stdout(tee):
-                reflect_and_learn(learn.request, learn.queries, learn.answer, mode="simple")
-            learn_run_count += 1
-
-            # 4. Score the injected rules
+            # 4. Score injected rules BEFORE synthesis so scores are fresh when
+            #    update_learnings_from_reflection reads the file
             if not baseline.error and learn.injected_rules:
                 delta = baseline.search_count - learn.search_count
                 score_injected_rules(learn.injected_rules, delta)
 
-            # 5. Consolidate every CONSOLIDATION_INTERVAL learn runs
+            # 5. Reflect on learn run → synthesise and rewrite learnings.md
+            print("\n  → Reflecting on learn run")
+            tee = _Tee()
+            with contextlib.redirect_stdout(tee):
+                reflect_and_learn(
+                    learn.request, learn.queries, learn.answer,
+                    mode=reflect_mode,
+                    search_log=getattr(learn, "_search_log", None),
+                )
+            learn_run_count += 1
+
+            # 6. Consolidate every CONSOLIDATION_INTERVAL learn runs
             if learn_run_count % CONSOLIDATION_INTERVAL == 0:
                 consolidate_learnings()
 
@@ -466,6 +502,12 @@ def main() -> None:
         help="Run only the specified group(s). Choices: A B C D E. Default: all.",
     )
     parser.add_argument(
+        "--reflect-mode",
+        choices=["simple", "advanced"],
+        default="advanced",
+        help="Reflection mode used after each learn run (default: advanced).",
+    )
+    parser.add_argument(
         "--dry-run", action="store_true",
         help="Print the selected dataset and exit without making any API calls.",
     )
@@ -487,7 +529,7 @@ def main() -> None:
 
     backup_and_reset_learnings()
 
-    records = run_interleaved_evaluation(active, output_path)
+    records = run_interleaved_evaluation(active, output_path, reflect_mode=args.reflect_mode)
 
     save_results(records, output_path)
     print(f"\nFinal results saved to {output_path} ({len(records)} records)")

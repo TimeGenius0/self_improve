@@ -52,16 +52,30 @@ except ImportError:
 MAX_SEARCHES = 10
 MAX_REFLECTION_SEARCHES = 15  # total budget across the 3 alternative strategies
 CONSOLIDATION_INTERVAL = 10   # consolidate learnings every N learn-mode runs
-LEARNINGS_FILE = Path(__file__).parent / "learnings.md"
+LEARNINGS_FILE = Path(__file__).parent.parent / "data" / "learnings.md"
 
-# Matches the score annotation appended to every rule: "  [u:3 h:2]"
-_SCORE_RE = re.compile(r'\s*\[u:(\d+) h:(\d+)\]$')
+# Matches the score annotation: "  [u:3 h:2]"
+_SCORE_RE = re.compile(r'\s*\[u:(\d+) h:(\d+)\]')
+# Matches the source annotation: "  [src: "req1" | "req2"]"
+_SRC_RE = re.compile(r'\s*\[src:[^\]]*\]')
 
 client = anthropic.Anthropic()
 
 
 def _strip_score(text: str) -> str:
-    """Remove the [u:N h:M] annotation from a rule bullet, returning clean rule text."""
+    """Remove [u:N h:M] and [src: ...] annotations, returning clean rule text."""
+    text = _SCORE_RE.sub('', text)
+    text = _SRC_RE.sub('', text)
+    return text.strip()
+
+
+def _strip_src(text: str) -> str:
+    """Remove only the [src: ...] annotation, keeping the score annotation."""
+    return _SRC_RE.sub('', text).strip()
+
+
+def _strip_score_only(text: str) -> str:
+    """Remove only the [u:N h:M] score annotation, keeping the [src: ...] annotation."""
     return _SCORE_RE.sub('', text).strip()
 
 
@@ -126,22 +140,25 @@ TOOLS = [
 ]
 
 
-def _run_tool_call(block, search_count: int, max_searches: int, limit_message: str) -> tuple[dict, int, str | None]:
+def _run_tool_call(
+    block, search_count: int, max_searches: int, limit_message: str
+) -> tuple[dict, int, str | None, str | None, str | None]:
     """
-    Execute a single tool_use block. Returns (tool_result_dict, new_count, query_or_None).
+    Execute a single tool_use block.
+    Returns (tool_result_dict, new_count, query_or_None, strategy_or_None, result_json_or_None).
     If the search limit is already reached, returns an error result without searching.
     """
     if search_count >= max_searches:
         result = json.dumps({"error": limit_message})
-        query = None
+        tool_result = {"type": "tool_result", "tool_use_id": block.id, "content": result}
+        return tool_result, search_count, None, None, None
     else:
         search_count += 1
         query = block.input["query"]
         strategy = block.input.get("strategy", "default")
         result = _search(query, strategy)
-
-    tool_result = {"type": "tool_result", "tool_use_id": block.id, "content": result}
-    return tool_result, search_count, query
+        tool_result = {"type": "tool_result", "tool_use_id": block.id, "content": result}
+        return tool_result, search_count, query, strategy, result
 
 
 # ---------------------------------------------------------------------------
@@ -196,7 +213,9 @@ End with a compact "pick X if…" line per option — one sentence, no padding.
 If a piece of information was not found, omit the field entirely."""
 
 
-def run_agent(user_request: str, injected_learnings: str = "") -> tuple[str, list[str]]:
+def run_agent(
+    user_request: str, injected_learnings: str = ""
+) -> tuple[str, list[str], list[dict]]:
     """
     Run the restaurant recommendation agent.
 
@@ -204,7 +223,8 @@ def run_agent(user_request: str, injected_learnings: str = "") -> tuple[str, lis
     search-strategy rules are appended to the system prompt before the first
     API call so the agent can apply them.
 
-    Returns (final_answer, list_of_queries_used).
+    Returns (final_answer, list_of_queries_used, search_log).
+    search_log is a list of dicts: {n, query, strategy, result_json}.
     """
     print(f"\nRequest: {user_request}")
     print("=" * 60)
@@ -213,8 +233,16 @@ def run_agent(user_request: str, injected_learnings: str = "") -> tuple[str, lis
     if injected_learnings:
         system += textwrap.dedent(f"""
 
-            ## Search strategy rules from past experience
-            Apply these rules when planning your searches for this request:
+            ## Proven search constraints — read before planning any searches
+
+            These rules were learned from real runs where the default broad-discovery
+            approach wasted searches or missed better candidates. Each rule identifies
+            a specific condition where the normal instinct is wrong.
+
+            Before you decide on your first query, check whether any rule below applies
+            to this request. If one does, follow it instead of defaulting to broad
+            discovery — the "because" clause explains what goes wrong if you don't.
+
             {injected_learnings}
         """)
         print("[Learning mode] Injected relevant past learnings.")
@@ -222,6 +250,7 @@ def run_agent(user_request: str, injected_learnings: str = "") -> tuple[str, lis
     messages = [{"role": "user", "content": user_request}]
     search_count = 0
     queries_used: list[str] = []
+    search_log: list[dict] = []
     final_answer = ""
 
     while True:
@@ -249,13 +278,18 @@ def run_agent(user_request: str, injected_learnings: str = "") -> tuple[str, lis
             for block in response.content:
                 if block.type != "tool_use":
                     continue
-                tool_result, search_count, query = _run_tool_call(
+                tool_result, search_count, query, strategy, result_json = _run_tool_call(
                     block, search_count, MAX_SEARCHES,
                     limit_message="Search limit reached. Give your final answer.",
                 )
                 if query:
-                    strategy = block.input.get("strategy", "default")
                     queries_used.append(query)
+                    search_log.append({
+                        "n": search_count,
+                        "query": query,
+                        "strategy": strategy,
+                        "result_json": result_json,
+                    })
                     print(f"[Search {search_count}/{MAX_SEARCHES}] [{strategy}] {query}")
                 tool_results.append(tool_result)
 
@@ -266,7 +300,7 @@ def run_agent(user_request: str, injected_learnings: str = "") -> tuple[str, lis
             print(f"[Unexpected stop_reason: {response.stop_reason}]")
             break
 
-    return final_answer, queries_used
+    return final_answer, queries_used, search_log
 
 
 # ---------------------------------------------------------------------------
@@ -283,117 +317,83 @@ def run_agent(user_request: str, injected_learnings: str = "") -> tuple[str, lis
 #              real results, then extracts evidence-backed learnings
 # ---------------------------------------------------------------------------
 
-_SIMPLE_REFLECTION_PROMPT = """You are a search-strategy analyst for a restaurant recommendation agent.
+_SIMPLE_REFLECTION_PROMPT = """You are a search-efficiency analyst for a restaurant recommendation agent.
 
-You will be given the user's request, the queries the agent ran, and its final answer.
+You receive the user's request, every search in order with its full results, and the final answer.
 
-Your job:
+Your only goal: find searches that could have been skipped or merged without losing any information.
 
-1. Describe the strategy used in one sentence.
+For each search ask: did this search surface anything that wasn't already in a prior search result, or that couldn't have been obtained in fewer total calls by a smarter first query?
 
-2. Propose 3 alternative strategies — each in one sentence. Vary entry point, query
-   type, or search budget split in a meaningful way.
+If no search was clearly wasteful, output LEARNINGS: none.
 
-3. For each alternative, reason briefly (2–3 sentences) on whether it would have
-   performed better, worse, or the same for THIS specific request.
+If a more efficient path exists, write at most 2 rules. Each rule must:
+- Be a concrete if/then instruction (not a general tip)
+- Explain exactly which search(es) it would eliminate and why those searches returned redundant or low-value results
+- Generalise to similar future requests, not just this one
+- Clearly save at least 1 search call when applied
 
-4. Decide whether any alternative is genuinely better — not just different, but
-   concretely better (fewer searches, stronger information, fewer missed candidates).
-   If none clears that bar, output LEARNINGS: none and stop.
-
-5. If there is a genuine improvement, extract 1–3 reusable rules in this format:
-   "if [condition about user request], then [specific search strategy action]"
-   Rules must apply across future requests, not just this one.
-
-Output format — use exactly these section headers:
-
-STRATEGY USED
-<one sentence>
-
-ALTERNATIVE 1
-<one sentence description>
-<reasoning>
-
-ALTERNATIVE 2
-<one sentence description>
-<reasoning>
-
-ALTERNATIVE 3
-<one sentence description>
-<reasoning>
-
+Format:
 LEARNINGS
-- <learning>
-(or "none" if no alternative is genuinely better)
-"""
+- if [condition], then [action] — saves [N] call(s) because [specific redundancy or failure observed in this run]
 
-_ADVANCED_REFLECTION_PROMPT = """You are a search-strategy analyst for a restaurant recommendation agent.
-You have access to the same search tool the agent uses.
+If no rule meets that bar: LEARNINGS: none"""
 
-You will be given the user's request, the queries the original agent ran (labelled
-strategy "original"), and its final answer.
+_ADVANCED_REFLECTION_PROMPT = """You are a search-efficiency analyst for a restaurant recommendation agent.
+You have access to the same search tool.
 
-## Step 1 — Devise 3 alternative strategies
+You receive the original request, the queries run (labelled strategy "original"), and the final answer.
 
-Think of 3 meaningfully different approaches. Dimensions to vary:
-- Entry point: geographic cluster vs. broad city query vs. forum/Reddit query
-- Budget split: heavy discovery vs. heavy per-candidate verification
-- Query type: dish-anchored vs. location-anchored vs. editorial-roundup-anchored
+## Step 1 — Identify the bottleneck
 
-## Step 2 — Execute each strategy
+Look at the original queries. Where did the agent spend the most calls? Was it discovery (finding candidates), verification (prices/menu/ambiance), or recovery (re-searching because an earlier query failed)? Name the costliest phase in one sentence.
 
-Run each alternative using the search tool. Label every search call with the strategy
-name (e.g. "cluster_first", "reddit_first", "editorial_roundup") via the `strategy`
-parameter. Aim for 3–5 searches per strategy; stop early if a strategy clearly fails.
+## Step 2 — Test one targeted alternative
 
-## Step 3 — Compare all 4 strategies on real results
+Pick the single most promising alternative that directly addresses the bottleneck. Run it (3–5 searches max, label strategy accordingly). Stop early if it clearly underperforms.
 
-- What candidates did each strategy surface?
-- How many searches did each need to reach 3 solid candidates?
-- Which found the most relevant detail (price / menu / ambiance) with fewest searches?
-- Did any alternative surface candidates the original missed?
+## Step 3 — Compare on search count only
+
+Did the alternative reach the same quality answer in fewer calls? Count searches required by each approach. If the alternative is not strictly fewer calls for equivalent output, output LEARNINGS: none.
 
 ## Step 4 — Extract learnings
 
-If any alternative is genuinely better (fewer searches, stronger candidates, fewer
-information gaps), write 2–4 reusable rules:
-"if [condition about user request], then [specific search strategy action]"
+If the alternative saves calls, write at most 2 rules. Each rule must:
+- State a concrete condition and action (not a general tip)
+- Name exactly which call(s) it eliminates and why those calls were wasteful
+- Generalise to similar future requests
 
-If no alternative clears that bar, output LEARNINGS: none.
-
-Output format — use exactly these section headers:
-
-STRATEGY USED
-<one sentence>
-
-ALTERNATIVE 1: <strategy name>
-<one sentence description>
-<2–3 sentence reasoning based on actual search results>
-
-ALTERNATIVE 2: <strategy name>
-<one sentence description>
-<2–3 sentence reasoning>
-
-ALTERNATIVE 3: <strategy name>
-<one sentence description>
-<2–3 sentence reasoning>
-
-COMPARISON
-<3–6 sentences comparing all four strategies on candidate quality, search count, and information relevance>
-
+Format:
 LEARNINGS
-- <learning>
-(or "none" if no alternative is genuinely better)
-"""
+- if [condition], then [action] — saves [N] call(s) because [specific wasteful pattern observed]
+
+If no rule meets that bar: LEARNINGS: none"""
 
 
-def _run_simple_reflection(user_request: str, queries_used: list[str], final_answer: str) -> str:
-    """Ask Claude to reason about alternative strategies without running any searches."""
+def _run_simple_reflection(
+    user_request: str,
+    queries_used: list[str],
+    final_answer: str,
+    search_log: list[dict] | None = None,
+) -> str:
+    """Analyse the actual search results to identify wasted searches and extract learnings."""
+    if search_log:
+        searches_block = "\n\n".join(
+            f"Search {entry['n']} [{entry['strategy']}]: {entry['query']}\n"
+            + entry["result_json"]
+            for entry in search_log
+        )
+    else:
+        # Fallback when no search log available (e.g. old callers)
+        searches_block = "\n".join(
+            f"Search {i+1}: {q}" for i, q in enumerate(queries_used)
+        )
+
     prompt = textwrap.dedent(f"""
         USER REQUEST: {user_request}
 
-        QUERIES USED (in order):
-        {chr(10).join(f"  {i+1}. {q}" for i, q in enumerate(queries_used))}
+        SEARCHES (in order, with full results):
+        {searches_block}
 
         FINAL ANSWER:
         {final_answer}
@@ -401,7 +401,7 @@ def _run_simple_reflection(user_request: str, queries_used: list[str], final_ans
 
     response = client.messages.create(
         model="claude-opus-4-7",
-        max_tokens=1024,
+        max_tokens=2048,
         system=_SIMPLE_REFLECTION_PROMPT,
         messages=[{"role": "user", "content": prompt}],
     )
@@ -444,12 +444,12 @@ def _run_advanced_reflection(user_request: str, queries_used: list[str], final_a
             for block in response.content:
                 if block.type != "tool_use":
                     continue
-                tool_result, search_count, query = _run_tool_call(
+                tool_result, search_count, query, strategy, _ = _run_tool_call(
                     block, search_count, MAX_REFLECTION_SEARCHES,
                     limit_message="Reflection search limit reached. Proceed to comparison and learnings.",
                 )
                 if query:
-                    strategy = block.input.get("strategy", "reflection")
+                    strategy = strategy or block.input.get("strategy", "reflection")
                     print(f"  [Reflection search {search_count}/{MAX_REFLECTION_SEARCHES}] [{strategy}] {query}")
                 tool_results.append(tool_result)
 
@@ -465,15 +465,43 @@ def _run_advanced_reflection(user_request: str, queries_used: list[str], final_a
     return ""
 
 
-def _save_learnings(user_request: str, reflection: str) -> bool:
-    """
-    Parse the LEARNINGS section of a reflection and append bullet rules to
-    learnings.md. Returns True if at least one rule was saved, False otherwise
-    (including when the reflection explicitly concludes LEARNINGS: none).
-    """
-    if "LEARNINGS" not in reflection:
-        return False
+_LEARNING_SYNTHESIS_PROMPT = """You maintain the rule library for a restaurant recommendation agent. The only purpose of every rule is to reduce the number of search tool calls the agent makes.
 
+You receive a reflection (with proposed rules under LEARNINGS:) and the current rule library.
+
+A rule earns its place only if:
+1. It saves at least 1 search call on the class of requests it targets
+2. It is specific enough to act on (not a general tip like "use aggregators")
+3. It generalises beyond the single request that produced it
+
+For each EXISTING rule decide:
+- KEEP   — still valid, no better phrasing; preserve score and [src: ...] exactly
+- UPDATE — evidence supports better phrasing; reset score to [u:0 h:0]; append current request to [src: ...]
+- MERGE  — overlaps with a proposed rule; combine into one tighter rule; keep higher score; union [src: ...]
+- REMOVE — contradicted by evidence, or can't plausibly save a call
+
+For each PROPOSED rule (from LEARNINGS:):
+- ADD   — passes the 3 criteria above; add [u:0 h:0] [src: "CURRENT_REQUEST"]
+- MERGE — already covered by an existing rule
+- SKIP  — vague, untestable, or unlikely to save a call
+
+Rule format (every bullet must follow this exactly):
+- if [condition], then [action] — saves ~N call(s) because [specific wasteful pattern]  [u:N h:M] [src: "req"]
+
+Output:
+CHANGES
+- <action> rule: <one-line reason> (omit KEEPs)
+
+RULES
+- <complete updated list>
+
+If LEARNINGS: none → CHANGES: (no changes), then existing rules verbatim."""
+
+
+def _extract_proposed_learnings(reflection: str) -> list[str]:
+    """Extract bullet lines from the LEARNINGS section of a reflection."""
+    if "LEARNINGS" not in reflection:
+        return []
     raw = reflection.split("LEARNINGS", 1)[1].strip()
     bullets = []
     for line in raw.splitlines():
@@ -481,22 +509,113 @@ def _save_learnings(user_request: str, reflection: str) -> bool:
         if not stripped:
             continue
         if stripped.lower() == "none":
-            return False
+            return []
         if stripped.startswith("-"):
-            # Initialise score annotation so every rule is trackable from birth
-            bullets.append(f"{stripped}  [u:0 h:0]")
+            bullets.append(stripped)
+    return bullets
 
-    if not bullets:
+
+def update_learnings_from_reflection(user_request: str, reflection: str) -> bool:
+    """
+    Holistic learnings update: sends the full reflection evidence plus all
+    existing rules to Opus, which decides keep/update/merge/remove/add for
+    every rule, then rewrites learnings.md as a single living document.
+
+    Falls back to bootstrap mode when the file is empty or missing.
+    Returns True if the file was written, False if there was nothing to save.
+    """
+    proposed = _extract_proposed_learnings(reflection)
+
+    existing_text = LEARNINGS_FILE.read_text() if LEARNINGS_FILE.exists() else ""
+    existing_bullets = [
+        line.strip()
+        for line in existing_text.splitlines()
+        if line.strip().startswith("-")
+    ]
+
+    # Bootstrap path: no existing rules yet — just write proposed rules directly
+    if not existing_bullets:
+        if not proposed:
+            return False
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+        bullets = [f'{b}  [u:0 h:0] [src: "{user_request}"]' for b in proposed]
+        content = (
+            "# Restaurant Agent — Strategy Learnings\n\n"
+            f"*Last updated: {timestamp} — {user_request}*\n\n"
+            + "\n".join(bullets) + "\n"
+        )
+        LEARNINGS_FILE.write_text(content)
+        return True
+
+    user_content = textwrap.dedent(f"""
+        REFLECTION FOR REQUEST: "{user_request}"
+
+        {reflection}
+
+        ───
+        CURRENT RULE LIBRARY ({len(existing_bullets)} rules):
+        {chr(10).join(existing_bullets)}
+    """).strip()
+
+    response = client.messages.create(
+        model="claude-opus-4-7",
+        max_tokens=2048,
+        thinking={"type": "adaptive"},
+        system=_LEARNING_SYNTHESIS_PROMPT,
+        messages=[{"role": "user", "content": user_content}],
+    )
+    result = next(
+        (block.text for block in response.content if hasattr(block, "text")), ""
+    )
+
+    # Parse CHANGES and RULES sections
+    changes_text = ""
+    rules_text = result
+    if "CHANGES" in result and "RULES" in result:
+        parts = result.split("RULES", 1)
+        changes_text = parts[0].split("CHANGES", 1)[1].strip()
+        rules_text = parts[1]
+    elif "CHANGES" in result:
+        changes_text = result.split("CHANGES", 1)[1].strip()
+        rules_text = ""
+
+    new_bullets = [
+        line.strip()
+        for line in rules_text.splitlines()
+        if line.strip().startswith("-")
+    ]
+    if not new_bullets:
         return False
 
-    if not LEARNINGS_FILE.exists():
-        LEARNINGS_FILE.write_text("# Restaurant Agent — Strategy Learnings\n\n")
+    # Print before/after diff
+    print("\n[RULE LIBRARY UPDATE]")
+    print("─" * 60)
+    print(f"BEFORE ({len(existing_bullets)} rules):")
+    for b in existing_bullets:
+        print(f"  {b}")
+    print(f"\nAFTER ({len(new_bullets)} rules):")
+    for b in new_bullets:
+        print(f"  {b}")
+    if changes_text and changes_text.lower() != "(no changes)":
+        print("\nCHANGES:")
+        for line in changes_text.splitlines():
+            if line.strip():
+                print(f"  {line.strip()}")
+    print("─" * 60)
 
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
-    block = f"\n## {timestamp} — {user_request}\n" + "\n".join(bullets) + "\n"
-    with LEARNINGS_FILE.open("a") as f:
-        f.write(block)
+    content = (
+        "# Restaurant Agent — Strategy Learnings\n\n"
+        f"*Last updated: {timestamp} — {user_request}*\n\n"
+        + "\n".join(new_bullets) + "\n"
+    )
+    tmp = LEARNINGS_FILE.with_suffix(".tmp")
+    tmp.write_text(content)
+    tmp.replace(LEARNINGS_FILE)
 
+    delta = len(new_bullets) - len(existing_bullets)
+    sign = "+" if delta >= 0 else ""
+    print(f"\n  [Synthesis complete: {len(existing_bullets)} → {len(new_bullets)} rules ({sign}{delta})]")
     return True
 
 
@@ -505,29 +624,31 @@ def reflect_and_learn(
     queries_used: list[str],
     final_answer: str,
     mode: str = "simple",
+    search_log: list[dict] | None = None,
 ) -> None:
     """
     Reflect on the search strategy used in a completed run and save any
     reusable learnings to learnings.md.
 
-    mode="simple"   — fast, no extra searches; Claude reasons hypothetically
-    mode="advanced" — slower; Claude actually runs the 3 alternatives via
-                      live searches before comparing and extracting learnings
+    mode="simple"   — analyses the actual search results to find wasted searches;
+                      no extra API searches needed
+    mode="advanced" — executes 3 alternative strategies via live searches, compares
+                      real results, then extracts evidence-backed learnings
     """
     print(f"\n[Reflecting on strategy... mode={mode}]")
 
     if mode == "advanced":
         reflection = _run_advanced_reflection(user_request, queries_used, final_answer)
     else:
-        reflection = _run_simple_reflection(user_request, queries_used, final_answer)
+        reflection = _run_simple_reflection(user_request, queries_used, final_answer, search_log)
 
     print("\n[REFLECTION]")
     print("-" * 40)
     print(reflection)
 
-    saved = _save_learnings(user_request, reflection)
+    saved = update_learnings_from_reflection(user_request, reflection)
     if saved:
-        print(f"\n[Learnings saved to {LEARNINGS_FILE}]")
+        print(f"\n[Learnings updated in {LEARNINGS_FILE}]")
     else:
         print("\n[No new learnings — no strategy was meaningfully better; nothing saved]")
 
@@ -552,29 +673,49 @@ def load_relevant_learnings(user_request: str) -> str:
     if not LEARNINGS_FILE.exists():
         return ""
 
-    # Strip score annotations — the agent only needs the clean rule text
-    all_bullets_clean = [
-        _strip_score(line.strip())
+    # Pass rule text + [src: ...] to Haiku so it can reason about source similarity.
+    # Strip only the score annotation — keep the src tag visible for matching.
+    all_bullets_with_src = [
+        _strip_score_only(line.strip())  # removes score, keeps src
         for line in LEARNINGS_FILE.read_text().splitlines()
         if line.strip().startswith("-")
     ]
-    if not all_bullets_clean:
+    if not all_bullets_with_src:
         return ""
 
     response = client.messages.create(
         model="claude-haiku-4-5-20251001",
-        max_tokens=512,
+        max_tokens=1024,
         messages=[{
             "role": "user",
             "content": textwrap.dedent(f"""
-                User request: "{user_request}"
+                Current request: "{user_request}"
 
-                Below are search-strategy rules learned from past restaurant queries.
-                Return only the rules directly applicable to THIS request, verbatim
-                as a bullet list. If none apply, reply with exactly: none
+                Below are search-strategy rules. Each rule shows which past request(s)
+                shaped it in a [src: ...] tag.
+
+                Select only rules applicable to the current request. For each candidate:
+                1. Is the rule abstractly relevant (condition matches the request type)?
+                2. How similar are the source request(s) to the current request?
+                   - CLOSE: same city, same cuisine type, same constraint
+                   - RELATED: same constraint type or occasion, different city/cuisine
+                   - DISTANT: different domain entirely
+
+                Only include a rule if it is abstractly relevant AND source similarity
+                is CLOSE or RELATED. Skip DISTANT rules even if abstractly relevant.
+
+                If none qualify, reply with exactly: none
+
+                Otherwise respond in this exact two-section format:
+
+                WHY
+                - rule N: [abstract relevance] | source similarity: CLOSE/RELATED — <one sentence on why>
+
+                RULES
+                - verbatim rule text only (no score annotations, no [src: ...])
 
                 Rules:
-                {chr(10).join(all_bullets_clean)}
+                {chr(10).join(all_bullets_with_src)}
             """).strip(),
         }],
     )
@@ -582,7 +723,45 @@ def load_relevant_learnings(user_request: str) -> str:
         (block.text for block in response.content if hasattr(block, "text")), ""
     ).strip()
 
-    return "" if (not result or result.lower() == "none") else result
+    if not result or result.lower() == "none":
+        print("  [Learning injection: no relevant rules found]")
+        return ""
+
+    # Parse WHY and RULES sections
+    why_text = ""
+    rules_text = result
+    if "WHY" in result and "RULES" in result:
+        parts = result.split("RULES", 1)
+        why_text = parts[0].split("WHY", 1)[1].strip()
+        rules_text = parts[1].strip()
+    elif "RULES" in result:
+        rules_text = result.split("RULES", 1)[1].strip()
+
+    injected_rules = "\n".join(
+        line.strip()
+        for line in rules_text.splitlines()
+        if line.strip().startswith("-")
+    )
+
+    if not injected_rules:
+        print("  [Learning injection: no relevant rules found]")
+        return ""
+
+    rule_count = injected_rules.count("\n") + 1
+    print(f"\n[LEARNING INJECTION — {rule_count} rule(s) retrieved]")
+    print("─" * 60)
+    if why_text:
+        print("Why these rules apply:")
+        for line in why_text.splitlines():
+            if line.strip():
+                print(f"  {line.strip()}")
+        print("\nInjected rules:")
+    for line in injected_rules.splitlines():
+        if line.strip():
+            print(f"  {line.strip()}")
+    print("─" * 60)
+
+    return injected_rules
 
 
 # ---------------------------------------------------------------------------
@@ -628,7 +807,11 @@ def score_injected_rules(injected_rules: str, search_delta: int) -> None:
             u, h = _parse_score(stripped)
             u += 1
             h += 1 if helped else 0
-            line = f"{_strip_score(stripped)}  [u:{u} h:{h}]"
+            # Preserve the [src: ...] annotation; only replace the score part
+            src_match = _SRC_RE.search(stripped)
+            src_tag = src_match.group(0).strip() if src_match else ""
+            clean = _strip_score(stripped)
+            line = f"{clean}  [u:{u} h:{h}]" + (f"  {src_tag}" if src_tag else "")
             updated += 1
         new_lines.append(line)
 
@@ -751,9 +934,9 @@ if __name__ == "__main__":
             print("[Learning mode] No relevant past learnings found.")
 
     # Run the agent
-    answer, queries = run_agent(request, injected_learnings=injected)
+    answer, queries, search_log = run_agent(request, injected_learnings=injected)
     if not answer:
         exit()
 
     # Reflect on the strategy and save any new learnings
-    reflect_and_learn(request, queries, answer, mode=args.reflect)
+    reflect_and_learn(request, queries, answer, mode=args.reflect, search_log=search_log)
