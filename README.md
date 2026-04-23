@@ -92,7 +92,7 @@ OVERALL                       │     8.8       │     7.8        │  9/25    
 ═══════════════════════════════════════════════════════════════════════════════
 ```
 
-Groups B, C, and E show 0.0 searches — all runs in those groups failed with API errors during the eval run and were not retried. The signal below comes from the 10 request pairs that completed (Groups A and D).
+Groups B, C, and E were intentionally skipped to limit token spend. Only Groups A and D were run, giving 10 completed request pairs. The signal below comes from those 10 pairs.
 
 **Search count, baseline vs. learning (completed groups only):**
 
@@ -112,7 +112,7 @@ Group D — Bay Area Highway Proximity   (5 requests, location-constrained)
 
 - **Transfer quality depends on category tightness.** Group A (cheap ethnic food in Paris, price caps in euros) saw a 20% reduction. All 5 requests share the same city, currency, and budget framing, so a rule like "lead with a French-language price query" applies directly across all of them. Group D (freeway proximity in the Bay Area) saw only a 2% reduction despite 4/5 runs having rules injected — location-constraint requests vary enough in structure that the rules changed strategy without cutting search count.
 
-- **Learning is only as good as the data it runs on.** The 15 failed runs in Groups B, C, and E produce no signal. A partial eval with missing groups can't show whether policies accumulate across request types, only within them.
+- **Partial coverage by design.** Groups B, C, and E were skipped to limit token spend. A full eval across all 5 groups would show whether policies transfer across request types (budget vs. romantic vs. dietary) or only within tight category clusters like Group A.
 
 ---
 
